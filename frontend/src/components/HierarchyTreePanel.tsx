@@ -71,12 +71,10 @@ function TreeNode({
                 ) : (
                     <span className="tree-chevron-spacer" />
                 )}
-                {!isCategory && (
-                    <span
-                        className="mastery-dot"
-                        style={{ background: MASTERY_COLORS[node.mastery] }}
-                    />
-                )}
+                <span
+                    className="mastery-dot"
+                    style={{ background: MASTERY_COLORS[node.mastery] }}
+                />
                 <span className={`tree-node-name ${isCategory ? 'tree-category-name' : ''}`}>{node.name}</span>
                 {isCategory && (
                     <span className="category-count">{node.children?.length || 0}</span>

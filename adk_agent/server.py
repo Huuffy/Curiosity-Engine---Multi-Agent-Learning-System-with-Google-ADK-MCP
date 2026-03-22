@@ -20,11 +20,14 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timezone
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types as genai_types
@@ -39,13 +42,156 @@ from curiosity_agent.sub_agents.conversation_agent import conversation_agent
 _MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
 _client = genai.Client()
 
-app = FastAPI(title="Curiosity Engine (ADK)")
+# ── Firestore persistence ──────────────────────────────────────────────────────
+
+_db = None
+if os.getenv("FIRESTORE_DISABLED", "").lower() != "true":
+    try:
+        from google.cloud import firestore as _fs
+        _db = _fs.AsyncClient(prefer_rest=True)
+    except Exception as _e:
+        print(f"[Firestore] Not available: {_e}. Running in-memory only.")
+
+
+# ── Firestore quota tracker ────────────────────────────────────────────────────
+
+_fs_quota: dict = {"day": None, "reads": 0, "writes": 0, "deletes": 0}
+_FS_LIMITS = {"reads": 50000, "writes": 20000, "deletes": 20000}
+_FS_WARN  = 0.80   # 80%  → warning toast
+_FS_BLOCK = 0.95   # 95%  → stop writing to protect free tier
+
+
+def _fs_check(op: str) -> str:
+    """Increment daily counter for op. Returns 'ok', 'warn', or 'block'."""
+    today = date.today().isoformat()
+    if _fs_quota["day"] != today:
+        _fs_quota.update({"day": today, "reads": 0, "writes": 0, "deletes": 0})
+    _fs_quota[op] = _fs_quota.get(op, 0) + 1
+    ratio = _fs_quota[op] / _FS_LIMITS[op]
+    if ratio >= _FS_BLOCK:
+        return "block"
+    if ratio >= _FS_WARN:
+        return "warn"
+    return "ok"
+
+
+def _flatten_for_firestore(node_map: dict) -> dict:
+    """Strip nested children lists before saving — reconstruct from children_ids on load."""
+    return {nid: {k: v for k, v in n.items() if k != "children"} for nid, n in node_map.items()}
+
+
+def _restore_children(node_map: dict) -> dict:
+    """Rebuild children lists from children_ids after loading from Firestore."""
+    for n in node_map.values():
+        n["children"] = [node_map[cid] for cid in n.get("children_ids", []) if cid in node_map]
+    return node_map
+
+
+async def _save_session(sid: str):
+    if _db is None:
+        return
+    s = sessions.get(sid)
+    if not s:
+        return
+    status = _fs_check("writes")
+    if status == "block":
+        print(f"[Firestore] Write quota at 95% — skipping save for {sid}")
+        return
+    try:
+        doc = {
+            "topic": s["topic"],
+            "status": s["status"],
+            "created_at": s.get("created_at", ""),
+            "message_count": s.get("message_count", 0),
+            "messages": s.get("messages", []),
+            "node_map": _flatten_for_firestore(s.get("node_map", {})),
+            "visit_stack": s.get("visit_stack", []),
+            "visited": list(s.get("visited", set())),
+            "stats": s.get("stats", {}),
+        }
+        await _db.collection("sessions").document(sid).set(doc)
+    except Exception as e:
+        print(f"[Firestore] Save error for {sid}: {e}")
+
+
+async def _load_sessions_from_firestore():
+    if _db is None:
+        return
+    try:
+        docs = await _db.collection("sessions").get()
+        loaded = 0
+        for doc in docs:
+            data = doc.to_dict()
+            sid = doc.id
+            status = data.get("status", "failed")
+            if status == "processing":
+                await _db.collection("sessions").document(sid).update({"status": "failed"})
+                continue
+            if status != "ready":
+                continue
+            uid = f"u_{sid[:8]}"
+            adk_sid = f"a_{sid[:8]}"
+            ss = InMemorySessionService()
+            await ss.create_session(app_name=APP, user_id=uid, session_id=adk_sid)
+            node_map = _restore_children(data.get("node_map", {}))
+            sessions[sid] = {
+                "topic": data["topic"],
+                "status": "ready",
+                "created_at": data.get("created_at", ""),
+                "message_count": data.get("message_count", 0),
+                "messages": data.get("messages", []),
+                "user_id": uid,
+                "adk_sid": adk_sid,
+                "session_service": ss,
+                "research_runner": Runner(agent=root_agent, app_name=APP, session_service=ss),
+                "conv_runner": Runner(agent=conversation_agent, app_name=APP, session_service=ss),
+                "hierarchy": node_map.get("root"),
+                "node_map": node_map,
+                "visit_stack": data.get("visit_stack", []),
+                "visited": set(data.get("visited", [])),
+                "review_queue": [],
+                "stats": data.get("stats", {}),
+            }
+            loaded += 1
+        print(f"[Firestore] Loaded {loaded} sessions.")
+    except Exception as e:
+        print(f"[Firestore] Load error: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app_: FastAPI):
+    await _load_sessions_from_firestore()
+    yield
+
+
+app = FastAPI(title="Curiosity Engine (ADK)", lifespan=lifespan)
+_origins_raw = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:4173")
+_origins = [o.strip() for o in _origins_raw.split(",")]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:4173"],
+    allow_origins=_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── App-key guard ───────────────────────────────────────────────────────────────
+# Rejects all non-OPTIONS requests that don't carry the correct X-App-Key header.
+# This prevents direct backend access from anyone who doesn't have the key
+# (bots, scrapers, quota abusers). The key is baked into the frontend bundle
+# and set as APP_SECRET_KEY on Cloud Run.
+
+_APP_KEY = os.getenv("APP_SECRET_KEY", "")
+
+
+class _AppKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if _APP_KEY and request.method != "OPTIONS" and request.url.path != "/api/health":
+            if request.headers.get("X-App-Key") != _APP_KEY:
+                return JSONResponse({"detail": "Forbidden"}, status_code=403)
+        return await call_next(request)
+
+
+app.add_middleware(_AppKeyMiddleware)
 
 # ── Rate limiting ──────────────────────────────────────────────────────────────
 
@@ -304,9 +450,11 @@ async def _run_agent(runner, user_id, session_id, text):
                     response = "".join(p.text for p in event.content.parts if p.text)
             return response or "_No response._"
         except Exception as exc:
-            if ("429" in str(exc) or "RESOURCE" in str(exc)) and attempt < 2:
-                await asyncio.sleep(15 * (2 ** attempt))
-                continue
+            if "429" in str(exc) or "RESOURCE" in str(exc):
+                if attempt < 2:
+                    await asyncio.sleep(15 * (2 ** attempt))
+                    continue
+                raise HTTPException(429, detail="rate_limited")
             raise
 
 
@@ -325,6 +473,12 @@ def _now():
 
 def _msg(role, content):
     return {"role": role, "content": content, "timestamp": _now()}
+
+
+def _append_msg(s: dict, role: str, content: str):
+    """Append a message and increment message_count."""
+    s["messages"].append(_msg(role, content))
+    s["message_count"] = s.get("message_count", 0) + 1
 
 
 def _cur_node(s):
@@ -386,7 +540,7 @@ async def _research_bg(session_id, topic):
             s["research_runner"], s["user_id"], s["adk_sid"],
             f"Teach me about: {topic}",
         )
-        s["messages"].append(_msg("assistant", response))
+        _append_msg(s, "assistant", response)
 
         # Build hierarchy from ADK state
         adk_sess = await s["session_service"].get_session(
@@ -428,10 +582,45 @@ async def _research_bg(session_id, topic):
             nm[children[0]]["mastery"] = "unknown"
 
         s["status"] = "ready"
+
+        # Auto-probe: after the overview, immediately ask about the first concept
+        # so the student knows exactly where to start and the tree is in sync
+        if children:
+            first = nm[children[0]]
+            probe_prompt = (
+                f"The teaching overview for '{topic}' has just been delivered. "
+                f"Now start the actual learning session. In one sentence introduce "
+                f"'{first['name']}', then ask a single concise probing question "
+                "to assess what the student already knows about it. "
+                "Do NOT explain the concept yet — just ask."
+            )
+            try:
+                probe_resp = await _run_agent(
+                    s["conv_runner"], s["user_id"], s["adk_sid"], probe_prompt,
+                )
+                _append_msg(s, "assistant", probe_resp)
+            except Exception:
+                pass  # Don't fail the session if the probe call fails
+
+        await _save_session(session_id)
+    except HTTPException:
+        _append_msg(s, "assistant", "**Rate limit hit.** Wait a minute and retry.")
+        s["status"] = "failed"
+        s["error"] = "Rate limited during research."
+        await _save_session(session_id)
     except Exception as exc:
-        s["messages"].append(_msg("assistant", _friendly_error(exc)))
+        import traceback
+        traceback.print_exc()   # full stack trace visible in Cloud Run logs
+        _append_msg(s, "assistant", _friendly_error(exc))
         s["status"] = "failed"
         s["error"] = _friendly_error(exc)
+        await _save_session(session_id)
+
+
+# ── App-level limits ───────────────────────────────────────────────────────────
+
+_MAX_SESSIONS = 10           # total concurrent chat sessions
+_MAX_MESSAGES  = 40          # follow-up messages per session
 
 
 # ── Globals ────────────────────────────────────────────────────────────────────
@@ -466,6 +655,8 @@ async def health():
 
 @app.post("/api/chat/start")
 async def start_session(body: TopicReq):
+    if len(sessions) >= _MAX_SESSIONS:
+        raise HTTPException(429, detail="session_limit")
     sid = str(uuid.uuid4())
     uid = f"u_{sid[:8]}"
     adk_sid = f"a_{sid[:8]}"
@@ -475,12 +666,15 @@ async def start_session(body: TopicReq):
 
     sessions[sid] = {
         "topic": body.topic, "status": "processing", "messages": [],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "message_count": 0,
         "user_id": uid, "adk_sid": adk_sid, "session_service": ss,
         "research_runner": Runner(agent=root_agent, app_name=APP, session_service=ss),
         "conv_runner": Runner(agent=conversation_agent, app_name=APP, session_service=ss),
         "hierarchy": None, "node_map": {}, "visit_stack": [],
         "visited": set(), "review_queue": [],
     }
+    asyncio.create_task(_save_session(sid))
     asyncio.create_task(_research_bg(sid, body.topic))
     return {"session_id": sid, "topic": body.topic, "status": "planning",
             "message": "Searching Wikipedia + web, building knowledge tree..."}
@@ -515,20 +709,39 @@ async def message(body: AnswerReq):
         raise HTTPException(404)
     if s["status"] != "ready":
         raise HTTPException(400, "Not ready")
+    if s.get("message_count", 0) >= _MAX_MESSAGES:
+        raise HTTPException(429, detail="message_limit")
 
     nid = _cur_node(s)
     nm = s.get("node_map", {})
+    concept = nm[nid]["name"] if nid and nid in nm else "the current topic"
     if nid and nid in nm:
         nm[nid]["mastery"] = "partial"
         nm[nid]["times_assessed"] += 1
 
-    s["messages"].append(_msg("user", body.answer))
+    _append_msg(s, "user", body.answer)
+
+    # Wrap the answer with concise-evaluation instructions so the agent
+    # doesn't spiral into another full teaching cycle with more questions.
+    eval_prompt = (
+        f"[Evaluating student on: '{concept}']\n"
+        f"Student's answer: {body.answer}\n\n"
+        "Respond concisely (3–5 sentences max):\n"
+        "1. Confirm what they got right (1–2 sentences).\n"
+        "2. If there is a gap, correct it in one sentence.\n"
+        "3. End with exactly one of these lines — do not ask another question:\n"
+        "   • If they understood well → 'Click **I Know This** to advance to the next concept.'\n"
+        "   • If they are still struggling → 'Click **I Don't Know** for a full walkthrough.'"
+    )
     try:
         resp = await _run_agent(
-            s["conv_runner"], s["user_id"], s["adk_sid"], body.answer,
+            s["conv_runner"], s["user_id"], s["adk_sid"], eval_prompt,
         )
-        s["messages"].append(_msg("assistant", resp))
+        _append_msg(s, "assistant", resp)
+        asyncio.create_task(_save_session(body.session_id))
         return _chat_resp(body.session_id, [_msg("assistant", resp)], s)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(502, _friendly_error(exc))
 
@@ -538,6 +751,8 @@ async def idk(body: SidReq):
     s = sessions.get(body.session_id)
     if not s:
         raise HTTPException(404)
+    if s.get("message_count", 0) >= _MAX_MESSAGES:
+        raise HTTPException(429, detail="message_limit")
 
     nid = _cur_node(s)
     nm = s.get("node_map", {})
@@ -555,17 +770,35 @@ async def idk(body: SidReq):
         if len(rq) > 10:
             rq.pop(0)
 
+    # Advance past current node BEFORE pushing children so the parent
+    # is not re-visited once its children are exhausted
+    vs = s.get("visit_stack", [])
+    vi = s.get("visited", set())
+    if nid and vs and vs[0] == nid:
+        vs.pop(0)
+    if nid:
+        vi.add(nid)
+        nm.get(nid, {})["is_current"] = False
+
     # Dynamic expansion: if leaf, generate 3-5 sub-concepts first
     expanded_names = []
     if nid and _is_leaf(nm, nid):
         new_ids = await _expand_node(s, nid)
         expanded_names = [nm[x]["name"] for x in new_ids if x in nm]
 
-    # Always push children into visit_stack (existing or newly expanded)
+    # Push children to front of stack (existing or newly expanded)
     if nid:
         _push_children(s, nid)
 
-    s["messages"].append(_msg("user", "I don't know about this yet."))
+    # Mark new current node
+    new_vs = s.get("visit_stack", [])
+    if new_vs:
+        new_cur = new_vs[0]
+        nm.get(new_cur, {})["is_current"] = True
+        if nm.get(new_cur, {}).get("mastery") == "not_covered":
+            nm[new_cur]["mastery"] = "unknown"
+
+    _append_msg(s, "user", "I don't know about this yet.")
 
     # Build context-aware prompt
     if expanded_names:
@@ -578,18 +811,31 @@ async def idk(body: SidReq):
     else:
         expand_info = ""
 
+    # First child in stack = what gets assessed after this explanation
+    first_child_name = nm.get(s.get("visit_stack", [None])[0], {}).get("name") \
+        if s.get("visit_stack") else None
+    next_probe = (
+        f"\n\nClose with a single focused question specifically about "
+        f"'{first_child_name}' — that is the first sub-concept the student "
+        "will be assessed on immediately after this explanation."
+        if first_child_name and first_child_name != concept else ""
+    )
+
     idk_text = (
         f"The student does not know '{concept}'. "
         "Teach this concept from scratch: use a real-world analogy, walk through the "
         "mechanics step by step, show a concrete example, and explain why it matters. "
-        f"Be detailed (400-600 words). {expand_info}"
+        f"Be detailed (400-600 words). {expand_info}{next_probe}"
     )
     try:
         resp = await _run_agent(
             s["conv_runner"], s["user_id"], s["adk_sid"], idk_text,
         )
-        s["messages"].append(_msg("assistant", resp))
+        _append_msg(s, "assistant", resp)
+        asyncio.create_task(_save_session(body.session_id))
         return _chat_resp(body.session_id, [_msg("assistant", resp)], s)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(502, _friendly_error(exc))
 
@@ -599,6 +845,8 @@ async def iknow(body: SidReq):
     s = sessions.get(body.session_id)
     if not s:
         raise HTTPException(404)
+    if s.get("message_count", 0) >= _MAX_MESSAGES:
+        raise HTTPException(429, detail="message_limit")
 
     nid = _cur_node(s)
     nm = s.get("node_map", {})
@@ -615,7 +863,7 @@ async def iknow(body: SidReq):
     next_nid = _cur_node(s)
     next_name = nm[next_nid]["name"] if next_nid and next_nid in nm else None
 
-    s["messages"].append(_msg("user", "I already know this — skip ahead."))
+    _append_msg(s, "user", "I already know this — skip ahead.")
 
     if next_name:
         prompt = (
@@ -635,8 +883,11 @@ async def iknow(body: SidReq):
         resp = await _run_agent(
             s["conv_runner"], s["user_id"], s["adk_sid"], prompt,
         )
-        s["messages"].append(_msg("assistant", resp))
+        _append_msg(s, "assistant", resp)
+        asyncio.create_task(_save_session(body.session_id))
         return _chat_resp(body.session_id, [_msg("assistant", resp)], s)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(502, _friendly_error(exc))
 
@@ -646,6 +897,8 @@ async def jump(body: JumpReq):
     s = sessions.get(body.session_id)
     if not s:
         raise HTTPException(404)
+    if s.get("message_count", 0) >= _MAX_MESSAGES:
+        raise HTTPException(429, detail="message_limit")
     nm = s.get("node_map", {})
     if body.node_id not in nm:
         raise HTTPException(404, "Node not found")
@@ -665,16 +918,81 @@ async def jump(body: JumpReq):
         nm[body.node_id]["mastery"] = "unknown"
 
     concept = nm[body.node_id]["name"]
-    s["messages"].append(_msg("user", f"Jump to: {concept}"))
+    _append_msg(s, "user", f"Jump to: {concept}")
     prompt = f"The student wants to jump to '{concept}'. Teach it now."
     try:
         resp = await _run_agent(
             s["conv_runner"], s["user_id"], s["adk_sid"], prompt,
         )
-        s["messages"].append(_msg("assistant", resp))
+        _append_msg(s, "assistant", resp)
+        asyncio.create_task(_save_session(body.session_id))
         return _chat_resp(body.session_id, [_msg("assistant", resp)], s)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(502, _friendly_error(exc))
+
+
+@app.get("/api/chat/sessions")
+async def list_sessions():
+    result = []
+    for sid, s in sessions.items():
+        p = _progress(s.get("node_map", {})) if s["status"] == "ready" else {}
+        result.append({
+            "session_id": sid,
+            "topic": s["topic"],
+            "status": s["status"],
+            "created_at": s.get("created_at", ""),
+            "message_count": s.get("message_count", 0),
+            "progress_pct": p.get("pct_complete", 0),
+        })
+    return {"sessions": sorted(result, key=lambda x: x["created_at"], reverse=True)}
+
+
+@app.delete("/api/chat/{sid}")
+async def delete_session(sid: str):
+    if sid not in sessions:
+        raise HTTPException(404, "Session not found")
+    sessions.pop(sid)
+    if _db is not None:
+        chk = _fs_check("deletes")
+        if chk != "block":
+            try:
+                await _db.collection("sessions").document(sid).delete()
+            except Exception as e:
+                print(f"[Firestore] Delete error for {sid}: {e}")
+    return {"deleted": sid}
+
+
+@app.get("/api/quota")
+async def quota_status():
+    today = date.today().isoformat()
+    if _fs_quota.get("day") != today:
+        return {"warnings": [], "usage": {"reads": 0, "writes": 0, "deletes": 0}}
+    warnings = []
+    for op, limit in _FS_LIMITS.items():
+        count = _fs_quota.get(op, 0)
+        ratio = count / limit
+        if ratio >= _FS_BLOCK:
+            warnings.append({
+                "type": f"firestore_{op}",
+                "level": "critical",
+                "message": (
+                    f"Firestore {op} quota critical: {count}/{limit} per day ({int(ratio*100)}%) — "
+                    "persistence paused to protect free tier. "
+                    "Contact virajbhatia.personal@gmail.com"
+                ),
+            })
+        elif ratio >= _FS_WARN:
+            warnings.append({
+                "type": f"firestore_{op}",
+                "level": "warning",
+                "message": (
+                    f"Firestore {op} quota at {int(ratio*100)}% ({count}/{limit} per day). "
+                    "Contact virajbhatia.personal@gmail.com if this continues."
+                ),
+            })
+    return {"warnings": warnings, "usage": {k: _fs_quota.get(k, 0) for k in ("reads", "writes", "deletes")}}
 
 
 # ── Routes: Graph ──────────────────────────────────────────────────────────────

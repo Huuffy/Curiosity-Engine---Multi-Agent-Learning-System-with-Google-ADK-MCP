@@ -22,8 +22,20 @@ adk_agent/generated/
 /.claude
 CLAUDE.md
 
-# Project notes
+# Project notes / scratch files
 project.md
+cloud.txt
+env.yaml
+
+# Presentations (binary, not for version control)
+*.pptx
+*.ppt
+
+# Frontend production env (contains live Cloud Run URL)
+frontend/.env.production
+
+# Logs
+*.log
 
 # Node / frontend
 node_modules/

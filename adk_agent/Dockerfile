@@ -15,5 +15,5 @@ RUN mkdir -p generated
 # Cloud Run default port
 EXPOSE 8080
 
-# ADK API server — makes the agent available over HTTP
-CMD ["adk", "api_server", "--port", "8080", "curiosity_agent"]
+# FastAPI bridge server — serves the custom React frontend API
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]

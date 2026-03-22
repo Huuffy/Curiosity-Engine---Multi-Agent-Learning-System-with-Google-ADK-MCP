@@ -123,6 +123,25 @@ export interface KnowledgeGraphData {
   edges: KnowledgeEdge[];
 }
 
+// ── Sessions List ────────────────────────────────────────────────
+
+export interface SessionListItem {
+  session_id: string;
+  topic: string;
+  status: string;
+  created_at: string;
+  message_count: number;
+  progress_pct: number;
+}
+
+// ── Toast Notifications ──────────────────────────────────────────
+
+export interface Toast {
+  id: string;
+  message: string;
+  type: 'error' | 'warning' | 'info';
+}
+
 // ── Teaching ──────────────────────────────────────────────────────
 
 export interface TeachingPlanNode {

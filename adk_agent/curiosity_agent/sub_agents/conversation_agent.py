@@ -21,8 +21,13 @@ Teach it thoroughly in 500-800 words with this structure:
 Clear, detailed explanation covering how it works, why it matters, and when to use it.
 
 ## Code Example
-If applicable, provide a practical code example in a relevant language using
-```language code blocks. Make the code runnable and well-commented.
+ONLY include a code block if the topic is a programming language, algorithm,
+data structure, software framework, database, networking protocol, or other
+computer science / software engineering concept.
+Do NOT generate code for non-technical subjects such as biology, chemistry,
+history, cooking, beauty, arts, sports, social sciences, medicine, or any
+real-world physical process. When in doubt, omit the code block entirely.
+If included, use ```language code blocks. Make the code runnable and well-commented.
 
 ## Key Points
 Bullet list of what differentiates strong understanding from surface-level.

@@ -18,13 +18,20 @@ import {
     sendIKnowThis,
     getSessionStatus,
     getChatHistory,
+    getProgress,
+    RateLimitError,
+    SessionLimitError,
+    MessageLimitError,
 } from '../services/api';
+import type { Toast } from '../types';
 
 interface Props {
     onSessionStart?: (sessionId: string, topic: string) => void;
     onGraphUpdate?: () => void;
     onNodeChange?: (nodeId: string | null) => void;
     chatRefreshTrigger?: number;
+    addToast?: (message: string, type: Toast['type']) => void;
+    joinRequest?: { sessionId: string; topic: string } | null;
 }
 
 const STAGE_LABELS: Record<string, string> = {
@@ -33,7 +40,16 @@ const STAGE_LABELS: Record<string, string> = {
     failed:   'Something went wrong.',
 };
 
-export default function ChatInterface({ onSessionStart, onGraphUpdate, onNodeChange, chatRefreshTrigger }: Props) {
+const RATE_LIMIT_MSG =
+    'Gemini rate limit reached — please wait ~1 minute and try again. For further queries contact virajbhatia.personal@gmail.com';
+
+const SESSION_LIMIT_MSG =
+    'To avoid too many requests and suppress the billing amount, limits are set: maximum 10 active chats reached. Please delete an existing chat to start a new one.';
+
+const MESSAGE_LIMIT_MSG =
+    'To avoid too many requests and suppress the billing amount, limits are set: maximum 40 messages per chat reached. Start a new chat to continue learning.';
+
+export default function ChatInterface({ onSessionStart, onGraphUpdate, onNodeChange, chatRefreshTrigger, addToast, joinRequest }: Props) {
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [input, setInput] = useState('');
     const [topic, setTopic] = useState('');
@@ -77,6 +93,36 @@ export default function ChatInterface({ onSessionStart, onGraphUpdate, onNodeCha
         })();
     }, [chatRefreshTrigger, sessionId]);
 
+    // Join an existing session from the sessions panel
+    useEffect(() => {
+        if (!joinRequest) return;
+        const { sessionId: sid, topic: t } = joinRequest;
+        setSessionId(sid);
+        setTopic(t);
+        setMessages([]);
+        setIsResearching(false);
+        setRequiresAnswer(false);
+        (async () => {
+            try {
+                const history = await getChatHistory(sid);
+                if (history.messages?.length) {
+                    setMessages(history.messages);
+                    setRequiresAnswer(true);
+                }
+                // Sync current node highlight from server state
+                try {
+                    const prog = await getProgress(sid);
+                    if (prog.current_node_id) onNodeChange?.(prog.current_node_id);
+                } catch { /* ignore */ }
+                onSessionStart?.(sid, t);
+                onGraphUpdate?.();
+            } catch {
+                // ignore
+            }
+        })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [joinRequest?.sessionId]);
+
     // ── Poll status ─────────────────────────────────────────────────────────
 
     const startPolling = useCallback((sid: string) => {
@@ -98,6 +144,11 @@ export default function ChatInterface({ onSessionStart, onGraphUpdate, onNodeCha
                         setMessages(history.messages);
                         setRequiresAnswer(true);
                     }
+                    // Sync current node highlight from server state
+                    try {
+                        const prog = await getProgress(sid);
+                        if (prog.current_node_id) onNodeChange?.(prog.current_node_id);
+                    } catch { /* ignore */ }
                     onGraphUpdate?.();
                 } else if (status.stage === 'failed') {
                     clearInterval(pollingRef.current!);
@@ -130,11 +181,15 @@ export default function ChatInterface({ onSessionStart, onGraphUpdate, onNodeCha
             startPolling(res.session_id);
         } catch (err) {
             setIsResearching(false);
-            setMessages([{
-                role: 'assistant',
-                content: `**Error:** ${err instanceof Error ? err.message : 'Failed'}. Is the server running on port 8000?`,
-                timestamp: new Date().toISOString(),
-            }]);
+            if (err instanceof SessionLimitError) {
+                addToast?.(SESSION_LIMIT_MSG, 'warning');
+            } else {
+                setMessages([{
+                    role: 'assistant',
+                    content: `**Error:** ${err instanceof Error ? err.message : 'Failed'}. Is the server running on port 8000?`,
+                    timestamp: new Date().toISOString(),
+                }]);
+            }
         } finally {
             setLoading(false);
         }
@@ -159,11 +214,17 @@ export default function ChatInterface({ onSessionStart, onGraphUpdate, onNodeCha
             if (res.current_branch) setCurrentBranch(res.current_branch);
             onGraphUpdate?.();
         } catch (err) {
-            setMessages((prev) => [...prev, {
-                role: 'assistant',
-                content: `**Error:** ${err instanceof Error ? err.message : 'Failed'}`,
-                timestamp: new Date().toISOString(),
-            }]);
+            if (err instanceof RateLimitError) {
+                addToast?.(RATE_LIMIT_MSG, 'warning');
+            } else if (err instanceof MessageLimitError) {
+                addToast?.(MESSAGE_LIMIT_MSG, 'warning');
+            } else {
+                setMessages((prev) => [...prev, {
+                    role: 'assistant',
+                    content: `**Error:** ${err instanceof Error ? err.message : 'Failed'}`,
+                    timestamp: new Date().toISOString(),
+                }]);
+            }
         } finally {
             setLoading(false);
         }
@@ -187,11 +248,17 @@ export default function ChatInterface({ onSessionStart, onGraphUpdate, onNodeCha
             if (res.current_branch) setCurrentBranch(res.current_branch);
             onGraphUpdate?.();
         } catch (err) {
-            setMessages((prev) => [...prev, {
-                role: 'assistant',
-                content: `**Error:** ${err instanceof Error ? err.message : 'Failed'}`,
-                timestamp: new Date().toISOString(),
-            }]);
+            if (err instanceof RateLimitError) {
+                addToast?.(RATE_LIMIT_MSG, 'warning');
+            } else if (err instanceof MessageLimitError) {
+                addToast?.(MESSAGE_LIMIT_MSG, 'warning');
+            } else {
+                setMessages((prev) => [...prev, {
+                    role: 'assistant',
+                    content: `**Error:** ${err instanceof Error ? err.message : 'Failed'}`,
+                    timestamp: new Date().toISOString(),
+                }]);
+            }
         } finally {
             setLoading(false);
         }
@@ -215,11 +282,17 @@ export default function ChatInterface({ onSessionStart, onGraphUpdate, onNodeCha
             if (res.current_branch) setCurrentBranch(res.current_branch);
             onGraphUpdate?.();
         } catch (err) {
-            setMessages((prev) => [...prev, {
-                role: 'assistant',
-                content: `**Error:** ${err instanceof Error ? err.message : 'Failed'}`,
-                timestamp: new Date().toISOString(),
-            }]);
+            if (err instanceof RateLimitError) {
+                addToast?.(RATE_LIMIT_MSG, 'warning');
+            } else if (err instanceof MessageLimitError) {
+                addToast?.(MESSAGE_LIMIT_MSG, 'warning');
+            } else {
+                setMessages((prev) => [...prev, {
+                    role: 'assistant',
+                    content: `**Error:** ${err instanceof Error ? err.message : 'Failed'}`,
+                    timestamp: new Date().toISOString(),
+                }]);
+            }
         } finally {
             setLoading(false);
         }
